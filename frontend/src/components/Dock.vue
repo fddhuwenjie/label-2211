@@ -33,6 +33,7 @@ const dockItems = [
   { app: 'calculator', icon: '🧮', label: 'Calculator' },
   { app: 'music', icon: '🎵', label: 'Music' },
   { app: 'settings', icon: '⚙️', label: 'System Preferences' },
+  { app: 'activity', icon: '📊', label: 'Activity Monitor' },
 ]
 
 function isOpen(app) {

@@ -12,6 +12,7 @@
         <div class="menu-item" @click="act('open-app', 'terminal')">Terminal</div>
         <div class="menu-item" @click="act('open-app', 'browser')">Safari</div>
         <div class="menu-item" @click="act('open-app', 'music')">Music</div>
+        <div class="menu-item" @click="act('open-app', 'activity')">Activity Monitor</div>
         <div class="menu-divider"></div>
         <div class="menu-item disabled">Sleep</div>
         <div class="menu-item disabled">Restart...</div>
