@@ -32,6 +32,10 @@
           <div class="icon-img music-icon">🎵</div>
           <span>Music</span>
         </div>
+        <div class="desktop-icon" @dblclick="openApp('activity')">
+          <div class="icon-img activity-icon">📊</div>
+          <span>Activity</span>
+        </div>
       </div>
 
       <!-- Windows -->
@@ -57,6 +61,10 @@
           v-if="win.app === 'music'" 
           @play-state-change="handleMusicPlayState"
           @song-change="handleMusicSongChange"
+        />
+        <ActivityMonitor
+          v-if="win.app === 'activity'"
+          @force-quit="closeWindow"
         />
       </MacWindow>
     </div>
@@ -97,6 +105,7 @@ import NotesApp from './components/apps/NotesApp.vue'
 import CalculatorApp from './components/apps/CalculatorApp.vue'
 import SettingsApp from './components/apps/SettingsApp.vue'
 import MusicApp from './components/apps/MusicApp.vue'
+import ActivityMonitor from './components/apps/ActivityMonitor.vue'
 
 const wallpapers = [
   'linear-gradient(135deg, #1a1a2e 0%, #16213e 50%, #0f3460 100%)',
@@ -129,6 +138,7 @@ const appNames = {
   calculator: 'Calculator',
   settings: 'System Preferences',
   music: 'Music',
+  activity: 'Activity Monitor',
 }
 
 const appDefaults = {
@@ -139,6 +149,7 @@ const appDefaults = {
   calculator: { w: 260, h: 400 },
   settings: { w: 540, h: 400 },
   music: { w: 420, h: 650 },
+  activity: { w: 700, h: 520 },
 }
 
 const activeAppName = computed(() => {
@@ -332,6 +343,7 @@ const musicControl = reactive({
 })
 
 provide('musicControl', musicControl)
+provide('windows', windows)
 
 // Global error boundary
 onErrorCaptured((err, instance, info) => {

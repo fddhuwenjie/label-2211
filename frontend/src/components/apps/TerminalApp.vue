@@ -112,6 +112,11 @@ const commands = {
     '  pwd              - Print working directory',
     '  cat <file>       - Display file contents',
     '  echo <text>      - Print text',
+    '  grep <pattern>   - Search text (use -i for case-insensitive)',
+    '  wc [file]        - Count lines/words/characters (use stdin if no file)',
+    '  head [file]      - Show first 10 lines (-n N for N lines)',
+    '  tail [file]      - Show last 10 lines (-n N for N lines)',
+    '  sort [file]      - Sort lines (-r for reverse)',
     '  mkdir <name>     - Create directory',
     '  touch <name>     - Create empty file',
     '  rm <name>        - Remove file or directory',
@@ -125,7 +130,76 @@ const commands = {
     '  neofetch         - System info display',
     '  logs [options]   - View system logs (--help for options)',
     '  help             - Show this help',
+    '',
+    '  Piping & Redirection:',
+    '  cmd1 | cmd2      - Pipe output of cmd1 to cmd2',
+    '  cmd > file       - Redirect output to file (overwrite)',
+    '  cmd >> file      - Redirect output to file (append)',
   ],
+  grep: (args, stdin) => {
+    const ignoreCase = args.includes('-i')
+    const patternArgs = args.filter(a => a !== '-i')
+    const pattern = patternArgs.join(' ')
+    const input = stdin || []
+    if (!pattern) return ['grep: missing pattern']
+    const regex = new RegExp(escapeRegex(pattern), ignoreCase ? 'i' : '')
+    return input.filter(line => regex.test(stripHtml(line)))
+  },
+  wc: (args, stdin) => {
+    let input = stdin || []
+    if (args[0] && !stdin) {
+      const parts = resolvePath(args[0])
+      const node = getNode(parts)
+      if (!node) return [`wc: ${args[0]}: No such file or directory`]
+      if (node.type === 'dir') return [`wc: ${args[0]}: Is a directory`]
+      input = node.content.split('\n')
+    }
+    const lines = input.length
+    const words = input.join(' ').split(/\s+/).filter(w => w).length
+    const chars = input.join('\n').length
+    return [`${lines} ${words} ${chars}`]
+  },
+  head: (args, stdin) => {
+    let input = stdin || []
+    let n = 10
+    const nIdx = args.indexOf('-n')
+    if (nIdx !== -1 && args[nIdx + 1]) n = parseInt(args[nIdx + 1]) || 10
+    if (args[0] && args[0] !== '-n' && !stdin) {
+      const parts = resolvePath(args[0])
+      const node = getNode(parts)
+      if (!node) return [`head: ${args[0]}: No such file or directory`]
+      if (node.type === 'dir') return [`head: ${args[0]}: Is a directory`]
+      input = node.content.split('\n')
+    }
+    return input.slice(0, n)
+  },
+  tail: (args, stdin) => {
+    let input = stdin || []
+    let n = 10
+    const nIdx = args.indexOf('-n')
+    if (nIdx !== -1 && args[nIdx + 1]) n = parseInt(args[nIdx + 1]) || 10
+    if (args[0] && args[0] !== '-n' && !stdin) {
+      const parts = resolvePath(args[0])
+      const node = getNode(parts)
+      if (!node) return [`tail: ${args[0]}: No such file or directory`]
+      if (node.type === 'dir') return [`tail: ${args[0]}: Is a directory`]
+      input = node.content.split('\n')
+    }
+    return input.slice(-n)
+  },
+  sort: (args, stdin) => {
+    let input = stdin || []
+    const reverse = args.includes('-r')
+    if (args[0] && args[0] !== '-r' && !stdin) {
+      const parts = resolvePath(args[0])
+      const node = getNode(parts)
+      if (!node) return [`sort: ${args[0]}: No such file or directory`]
+      if (node.type === 'dir') return [`sort: ${args[0]}: Is a directory`]
+      input = node.content.split('\n')
+    }
+    const sorted = [...input].sort((a, b) => a.localeCompare(b))
+    return reverse ? sorted.reverse() : sorted
+  },
   ls: (args) => {
     const target = args[0] || currentDir.value
     const parts = resolvePath(target)
@@ -258,21 +332,31 @@ function execute() {
   if (cmd) {
     history.value.push(cmd)
     historyIdx.value = history.value.length
-    const parts = cmd.split(/\s+/)
-    const name = parts[0]
-    const args = parts.slice(1)
     logger.debug('Terminal', `Execute: ${cmd}`)
-    if (commands[name]) {
-      try {
-        const output = commands[name](args)
-        lines.value.push(...output)
-      } catch (err) {
-        logger.error('Terminal', `Command "${name}" threw an error`, { error: err.message, stack: err.stack })
-        lines.value.push(`<span style="color:#ff5f57">Error: ${escapeHtml(err.message)}</span>`)
+
+    const { pipeParts, redirect, redirectType } = parseCommand(cmd)
+    let output = []
+    let hasError = false
+
+    for (let i = 0; i < pipeParts.length; i++) {
+      const part = pipeParts[i]
+      if (!part) continue
+      const result = runSingleCommand(part, i === 0 ? null : output)
+      output = result.output
+      if (result.error) {
+        hasError = true
+        break
+      }
+    }
+
+    if (redirect && !hasError) {
+      const content = output.join('\n')
+      const writeResult = writeToFile(redirect, content, redirectType === 'append')
+      if (writeResult.length > 0) {
+        lines.value.push(...writeResult)
       }
     } else {
-      logger.warn('Terminal', `Unknown command: ${name}`)
-      lines.value.push(`zsh: command not found: ${escapeHtml(name)}`)
+      lines.value.push(...output)
     }
   }
   currentInput.value = ''
@@ -283,6 +367,63 @@ function execute() {
 
 function escapeHtml(str) {
   return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+}
+
+function escapeRegex(str) {
+  return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
+function stripHtml(str) {
+  return str.replace(/<[^>]*>/g, '')
+}
+
+function parseCommand(cmd) {
+  let redirect = null
+  let redirectType = null
+  const appendMatch = cmd.match(/^(.*?)\s*>>\s*(\S+)\s*$/)
+  const writeMatch = cmd.match(/^(.*?)\s*>\s*(\S+)\s*$/)
+  if (appendMatch) {
+    cmd = appendMatch[1].trim()
+    redirect = appendMatch[2]
+    redirectType = 'append'
+  } else if (writeMatch) {
+    cmd = writeMatch[1].trim()
+    redirect = writeMatch[2]
+    redirectType = 'write'
+  }
+  const pipeParts = cmd.split('|').map(p => p.trim())
+  return { pipeParts, redirect, redirectType }
+}
+
+function runSingleCommand(cmdStr, stdin = null) {
+  const parts = cmdStr.split(/\s+/)
+  const name = parts[0]
+  const args = parts.slice(1)
+  if (!commands[name]) return { output: [`zsh: command not found: ${escapeHtml(name)}`], error: true }
+  try {
+    const output = commands[name](args, stdin)
+    return { output, error: false }
+  } catch (err) {
+    return { output: [`<span style="color:#ff5f57">Error: ${escapeHtml(err.message)}</span>`], error: true }
+  }
+}
+
+function writeToFile(path, content, append) {
+  const parts = resolvePath(path)
+  const { parent, name } = getParentAndName(parts)
+  const p = parts.length <= 1 ? (resolvePath(currentDir.value).length === 0 ? fs.value['~'] : getNode(resolvePath(currentDir.value))) : parent
+  if (!p || p.type !== 'dir') return [`zsh: cannot create ${path}: No such file or directory`]
+  if (!p.children[name]) {
+    p.children[name] = { type: 'file', content: '' }
+  }
+  const node = p.children[name]
+  if (node.type === 'dir') return [`zsh: ${path}: Is a directory`]
+  if (append) {
+    node.content = (node.content ? node.content + '\n' : '') + content
+  } else {
+    node.content = content
+  }
+  return []
 }
 
 function historyUp() {
