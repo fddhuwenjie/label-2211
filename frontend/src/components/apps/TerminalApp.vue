@@ -104,6 +104,29 @@ function getParentAndName(pathParts) {
   return { parent, name }
 }
 
+let pipeInput = null
+
+function stripHtml(html) {
+  return html.replace(/<[^>]*>/g, '')
+}
+
+function runCommand(name, args) {
+  const input = pipeInput
+  pipeInput = null
+  if (!commands[name]) return [`zsh: command not found: ${name}`]
+  try {
+    const savedPipeInput = input
+    pipeInput = savedPipeInput
+    const output = commands[name](args)
+    return output
+  } catch (err) {
+    logger.error('Terminal', `Command "${name}" threw an error`, { error: err.message, stack: err.stack })
+    return [`<span style="color:#ff5f57">Error: ${escapeHtml(err.message)}</span>`]
+  }
+}
+
+const pipeAwareCommands = new Set(['grep', 'wc', 'head', 'tail', 'sort'])
+
 const commands = {
   help: () => [
     'Available commands:',
@@ -124,7 +147,15 @@ const commands = {
     '  history          - Command history',
     '  neofetch         - System info display',
     '  logs [options]   - View system logs (--help for options)',
+    '  grep <pattern> [-i]  - Filter lines matching pattern (-i: ignore case)',
+    '  wc               - Count lines/words/chars',
+    '  head [-n <N>]    - Show first N lines (default 10)',
+    '  tail [-n <N>]    - Show last N lines (default 10)',
+    '  sort [-r]        - Sort lines (-r: reverse)',
     '  help             - Show this help',
+    '',
+    'Pipeline: cmd1 | cmd2 | cmd3',
+    'Redirect: cmd > file (overwrite), cmd >> file (append)',
   ],
   ls: (args) => {
     const target = args[0] || currentDir.value
@@ -250,31 +281,182 @@ const commands = {
     '<span style="color:#28c840">  ;MMMMMMMMMMMMMMMMMMMMMMMM.  </span>  CPU: JavaScript V8',
     '<span style="color:#28c840">    :MMMMMMMMMMMMMMMMMMMMMMMM: </span>  Memory: ∞ MB',
   ],
+  grep: (args) => {
+    let ignoreCase = false
+    const filteredArgs = []
+    for (const a of args) {
+      if (a === '-i') ignoreCase = true
+      else filteredArgs.push(a)
+    }
+    const pattern = filteredArgs[0]
+    if (!pattern) return ['grep: missing pattern']
+    const inputLines = pipeInput
+    pipeInput = null
+    if (inputLines === null) return ['grep: no input (use with pipe or provide file)']
+    const plainLines = inputLines.map(stripHtml)
+    const flags = ignoreCase ? 'i' : ''
+    try {
+      const regex = new RegExp(pattern, flags)
+      const result = []
+      for (let i = 0; i < plainLines.length; i++) {
+        if (regex.test(plainLines[i])) {
+          result.push(inputLines[i])
+        }
+      }
+      return result.length > 0 ? result : []
+    } catch (e) {
+      return [`grep: invalid pattern: ${pattern}`]
+    }
+  },
+  wc: (args) => {
+    const inputLines = pipeInput
+    pipeInput = null
+    if (inputLines === null) return ['wc: no input (use with pipe)']
+    const text = inputLines.map(stripHtml).join('\n')
+    const lineCount = inputLines.length
+    const wordCount = text.split(/\s+/).filter(Boolean).length
+    const charCount = text.length
+    return [`  ${lineCount}\t${wordCount}\t${charCount}`]
+  },
+  head: (args) => {
+    let n = 10
+    for (let i = 0; i < args.length; i++) {
+      if (args[i] === '-n' && args[i + 1]) {
+        n = parseInt(args[i + 1]) || 10
+        i++
+      }
+    }
+    const inputLines = pipeInput
+    pipeInput = null
+    if (inputLines === null) return ['head: no input (use with pipe)']
+    return inputLines.slice(0, n)
+  },
+  tail: (args) => {
+    let n = 10
+    for (let i = 0; i < args.length; i++) {
+      if (args[i] === '-n' && args[i + 1]) {
+        n = parseInt(args[i + 1]) || 10
+        i++
+      }
+    }
+    const inputLines = pipeInput
+    pipeInput = null
+    if (inputLines === null) return ['tail: no input (use with pipe)']
+    return inputLines.slice(-n)
+  },
+  sort: (args) => {
+    const reverse = args.includes('-r')
+    const inputLines = pipeInput
+    pipeInput = null
+    if (inputLines === null) return ['sort: no input (use with pipe)']
+    const sorted = [...inputLines].sort((a, b) => {
+      const sa = stripHtml(a)
+      const sb = stripHtml(b)
+      return sa.localeCompare(sb)
+    })
+    if (reverse) sorted.reverse()
+    return sorted
+  },
 }
 
 function execute() {
   const cmd = currentInput.value.trim()
   lines.value.push(`<span class="prompt-display">${prompt.value}</span>${escapeHtml(cmd)}`)
-  if (cmd) {
-    history.value.push(cmd)
-    historyIdx.value = history.value.length
-    const parts = cmd.split(/\s+/)
-    const name = parts[0]
-    const args = parts.slice(1)
-    logger.debug('Terminal', `Execute: ${cmd}`)
-    if (commands[name]) {
-      try {
-        const output = commands[name](args)
-        lines.value.push(...output)
-      } catch (err) {
-        logger.error('Terminal', `Command "${name}" threw an error`, { error: err.message, stack: err.stack })
-        lines.value.push(`<span style="color:#ff5f57">Error: ${escapeHtml(err.message)}</span>`)
+  if (!cmd) {
+    currentInput.value = ''
+    nextTick(() => {
+      if (outputEl.value) outputEl.value.scrollTop = outputEl.value.scrollHeight
+    })
+    return
+  }
+  history.value.push(cmd)
+  historyIdx.value = history.value.length
+  logger.debug('Terminal', `Execute: ${cmd}`)
+
+  let redirectFile = null
+  let redirectAppend = false
+  let processedCmd = cmd
+
+  const redirectMatch = processedCmd.match(/^(.+?)\s*(>>|>)\s*(\S+)\s*$/)
+  if (redirectMatch) {
+    processedCmd = redirectMatch[1].trim()
+    redirectAppend = redirectMatch[2] === '>>'
+    redirectFile = redirectMatch[3]
+  }
+
+  const pipeSegments = []
+  let current = ''
+  let inSingleQuote = false
+  let inDoubleQuote = false
+  for (let i = 0; i < processedCmd.length; i++) {
+    const ch = processedCmd[i]
+    if (ch === "'" && !inDoubleQuote) { inSingleQuote = !inSingleQuote; current += ch; continue }
+    if (ch === '"' && !inSingleQuote) { inDoubleQuote = !inDoubleQuote; current += ch; continue }
+    if (ch === '|' && !inSingleQuote && !inDoubleQuote) {
+      pipeSegments.push(current.trim())
+      current = ''
+      continue
+    }
+    current += ch
+  }
+  if (current.trim()) pipeSegments.push(current.trim())
+
+  if (pipeSegments.length === 0) {
+    currentInput.value = ''
+    nextTick(() => {
+      if (outputEl.value) outputEl.value.scrollTop = outputEl.value.scrollHeight
+    })
+    return
+  }
+
+  let output = []
+  pipeInput = null
+
+  for (let si = 0; si < pipeSegments.length; si++) {
+    const segment = pipeSegments[si]
+    const tokens = segment.split(/\s+/)
+    const name = tokens[0]
+    const args = tokens.slice(1)
+
+    if (si > 0) {
+      pipeInput = output
+    }
+
+    if (pipeAwareCommands.has(name)) {
+      const result = runCommand(name, args)
+      output = result
+    } else if (commands[name]) {
+      if (pipeInput !== null) {
+        output = []
       }
+      const result = runCommand(name, args)
+      output = result
     } else {
       logger.warn('Terminal', `Unknown command: ${name}`)
-      lines.value.push(`zsh: command not found: ${escapeHtml(name)}`)
+      output = [`zsh: command not found: ${name}`]
     }
   }
+
+  if (redirectFile) {
+    const parts = resolvePath(redirectFile)
+    const { parent, name: fileName } = getParentAndName(parts)
+    const dirNode = parts.length <= 1
+      ? (resolvePath(currentDir.value).length === 0 ? fs.value['~'] : getNode(resolvePath(currentDir.value)))
+      : parent
+    if (!dirNode || dirNode.type !== 'dir') {
+      lines.value.push(`<span style="color:#ff5f57">${redirectFile}: No such directory</span>`)
+    } else {
+      const content = output.map(stripHtml).join('\n')
+      if (redirectAppend && dirNode.children[fileName] && dirNode.children[fileName].type === 'file') {
+        dirNode.children[fileName].content += '\n' + content
+      } else {
+        dirNode.children[fileName] = { type: 'file', content }
+      }
+      output = []
+    }
+  }
+
+  lines.value.push(...output)
   currentInput.value = ''
   nextTick(() => {
     if (outputEl.value) outputEl.value.scrollTop = outputEl.value.scrollHeight
