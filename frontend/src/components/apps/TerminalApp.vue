@@ -124,6 +124,11 @@ const commands = {
     '  history          - Command history',
     '  neofetch         - System info display',
     '  logs [options]   - View system logs (--help for options)',
+    '  grep [options] <pattern> - Search for pattern in input',
+    '  wc [options]     - Count lines/words/characters',
+    '  head [options]   - Show first N lines',
+    '  tail [options]   - Show last N lines',
+    '  sort [options]   - Sort lines',
     '  help             - Show this help',
   ],
   ls: (args) => {
@@ -250,6 +255,115 @@ const commands = {
     '<span style="color:#28c840">  ;MMMMMMMMMMMMMMMMMMMMMMMM.  </span>  CPU: JavaScript V8',
     '<span style="color:#28c840">    :MMMMMMMMMMMMMMMMMMMMMMMM: </span>  Memory: ∞ MB',
   ],
+  grep: (args, input) => {
+    const ignoreCase = args.includes('-i')
+    const pattern = args.filter(a => a !== '-i').join(' ')
+    if (!pattern) return ['grep: missing pattern']
+    const lines = input || []
+    const regex = new RegExp(pattern, ignoreCase ? 'i' : '')
+    return lines.filter(line => regex.test(stripHtml(line)))
+  },
+  wc: (args, input) => {
+    const lines = input || []
+    const countLines = args.includes('-l')
+    const countWords = args.includes('-w')
+    const countChars = args.includes('-c')
+    const showAll = !countLines && !countWords && !countChars
+    let l = lines.length
+    let w = lines.reduce((acc, line) => acc + stripHtml(line).split(/\s+/).filter(Boolean).length, 0)
+    let c = lines.reduce((acc, line) => acc + stripHtml(line).length, 0) + (lines.length > 0 ? lines.length - 1 : 0)
+    if (showAll) return [`  ${l}  ${w}  ${c}`]
+    const result = []
+    if (countLines) result.push(String(l))
+    if (countWords) result.push(String(w))
+    if (countChars) result.push(String(c))
+    return ['  ' + result.join('  ')]
+  },
+  head: (args, input) => {
+    const lines = input || []
+    const nIdx = args.indexOf('-n')
+    let n = 10
+    if (nIdx !== -1 && args[nIdx + 1]) n = parseInt(args[nIdx + 1]) || 10
+    else if (args[0] && args[0].startsWith('-')) n = parseInt(args[0].slice(1)) || 10
+    return lines.slice(0, n)
+  },
+  tail: (args, input) => {
+    const lines = input || []
+    const nIdx = args.indexOf('-n')
+    let n = 10
+    if (nIdx !== -1 && args[nIdx + 1]) n = parseInt(args[nIdx + 1]) || 10
+    else if (args[0] && args[0].startsWith('-')) n = parseInt(args[0].slice(1)) || 10
+    return lines.slice(-n)
+  },
+  sort: (args, input) => {
+    const lines = input || []
+    const reverse = args.includes('-r')
+    const sorted = [...lines].sort((a, b) => {
+      const aStr = stripHtml(a)
+      const bStr = stripHtml(b)
+      return aStr.localeCompare(bStr)
+    })
+    if (reverse) sorted.reverse()
+    return sorted
+  },
+}
+
+function stripHtml(str) {
+  return str.replace(/<[^>]*>/g, '')
+}
+
+function parseCommand(cmd) {
+  let redirectOut = null
+  let redirectAppend = false
+  let redirectMatch = cmd.match(/\s+>>\s+(\S+)$/)
+  if (redirectMatch) {
+    redirectOut = redirectMatch[1]
+    redirectAppend = true
+    cmd = cmd.slice(0, redirectMatch.index)
+  } else {
+    redirectMatch = cmd.match(/\s+>\s+(\S+)$/)
+    if (redirectMatch) {
+      redirectOut = redirectMatch[1]
+      redirectAppend = false
+      cmd = cmd.slice(0, redirectMatch.index)
+    }
+  }
+  const pipeParts = cmd.split(/\s+\|\s+/)
+  return { pipeParts, redirectOut, redirectAppend }
+}
+
+function writeToFile(path, content, append) {
+  const parts = resolvePath(path)
+  const { parent, name } = getParentAndName(parts)
+  const p = parts.length <= 1 ? (resolvePath(currentDir.value).length === 0 ? fs.value['~'] : getNode(resolvePath(currentDir.value))) : parent
+  if (!p || p.type !== 'dir') return [`cannot write to '${path}': No such file or directory`]
+  if (!p.children[name]) {
+    p.children[name] = { type: 'file', content: '' }
+  }
+  const node = p.children[name]
+  if (node.type !== 'file') return [`cannot write to '${path}': Is a directory`]
+  if (append) {
+    node.content += (node.content ? '\n' : '') + content
+  } else {
+    node.content = content
+  }
+  return []
+}
+
+function executeSingleCmd(cmdStr, input) {
+  const parts = cmdStr.split(/\s+/)
+  const name = parts[0]
+  const args = parts.slice(1)
+  if (!commands[name]) {
+    return { success: false, output: [`zsh: command not found: ${escapeHtml(name)}`] }
+  }
+  try {
+    const output = commands[name](args, input)
+    return { success: true, output }
+  } catch (err) {
+    logger.error('Terminal', `Command "${name}" threw an error`, { error: err.message, stack: err.stack })
+    return { success: false, output: [`<span style="color:#ff5f57">Error: ${escapeHtml(err.message)}</span>`] }
+  }
 }
 
 function execute() {
@@ -258,22 +372,33 @@ function execute() {
   if (cmd) {
     history.value.push(cmd)
     historyIdx.value = history.value.length
-    const parts = cmd.split(/\s+/)
-    const name = parts[0]
-    const args = parts.slice(1)
     logger.debug('Terminal', `Execute: ${cmd}`)
-    if (commands[name]) {
-      try {
-        const output = commands[name](args)
-        lines.value.push(...output)
-      } catch (err) {
-        logger.error('Terminal', `Command "${name}" threw an error`, { error: err.message, stack: err.stack })
-        lines.value.push(`<span style="color:#ff5f57">Error: ${escapeHtml(err.message)}</span>`)
+    const { pipeParts, redirectOut, redirectAppend } = parseCommand(cmd)
+    let currentInput = null
+    let finalOutput = []
+    let errorOccurred = false
+    for (let i = 0; i < pipeParts.length; i++) {
+      const pipeCmd = pipeParts[i].trim()
+      if (!pipeCmd) continue
+      const result = executeSingleCmd(pipeCmd, currentInput)
+      if (!result.success) {
+        finalOutput = result.output
+        errorOccurred = true
+        break
       }
-    } else {
-      logger.warn('Terminal', `Unknown command: ${name}`)
-      lines.value.push(`zsh: command not found: ${escapeHtml(name)}`)
+      currentInput = result.output
+      finalOutput = result.output
     }
+    if (!errorOccurred && redirectOut) {
+      const content = finalOutput.map(line => stripHtml(line)).join('\n')
+      const writeResult = writeToFile(redirectOut, content, redirectAppend)
+      if (writeResult.length > 0) {
+        finalOutput = writeResult
+      } else {
+        finalOutput = []
+      }
+    }
+    lines.value.push(...finalOutput)
   }
   currentInput.value = ''
   nextTick(() => {
